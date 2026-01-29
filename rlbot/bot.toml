@@ -1,0 +1,15 @@
+[settings]
+name = "CompetitiveBot"
+run_command = "python bot.py"
+agent_id = "competitive-rl-bot"
+
+[details]
+developer = "Louis Giraud"
+description = "Deep RL Rocket League bot using PPO with Actor-Attention-Critic"
+fun_fact = "Trained using Proximal Policy Optimization with multi-head self-attention"
+github = ""
+language = "python"
+
+[requirements]
+# Minimum requirements for running the bot
+rlbot_version = "2.0.0"

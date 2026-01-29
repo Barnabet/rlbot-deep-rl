@@ -1,0 +1,18 @@
+# 3v3 PPO training configuration
+
+environment:
+  team_size: 3
+  spawn_opponents: true
+  timeout_seconds: 300
+
+training:
+  n_workers: 16
+  n_envs_per_worker: 4
+
+ppo:
+  batch_size: 200_000
+  minibatch_size: 50_000
+
+rewards:
+  team_spirit: 0.5
+  team_spacing_penalty: -0.15
