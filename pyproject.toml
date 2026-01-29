@@ -23,9 +23,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "rlgym>=2.0.0",
-    "rlgym-tools>=2.0.0",
-    "rlgym-sim>=2.0.0",
+    "rlgym[rl-sim]>=2.0.0",
     "torch>=2.0.0",
     "numpy>=1.24.0",
     "omegaconf>=2.3.0",

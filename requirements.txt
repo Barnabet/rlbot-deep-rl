@@ -1,9 +1,6 @@
 # Core RL dependencies
-rlgym>=2.0.0
-rlgym-tools>=2.0.0
-rlgym-sim>=2.0.0
-# rlgym-ppo is optional - install from git if needed:
-# pip install git+https://github.com/AechPro/rlgym-ppo.git
+# Install with: pip install rlgym[rl-sim]
+rlgym[rl-sim]>=2.0.0
 
 # Deep learning
 torch>=2.0.0
