@@ -268,11 +268,14 @@ def main(cfg: DictConfig) -> None:
         curriculum_config=configs['curriculum'],
     )
 
-    # Resume from checkpoint if available
+    # Resume from checkpoint if available (unless fresh_start is set)
+    fresh_start = cfg.get('fresh_start', False)
     checkpoint_path = Path(configs['training'].checkpoint_dir) / "latest.pt"
-    if checkpoint_path.exists():
+    if checkpoint_path.exists() and not fresh_start:
         print(f"\nResuming from checkpoint: {checkpoint_path}")
         coordinator.load(str(checkpoint_path))
+    elif fresh_start:
+        print("\nStarting fresh (ignoring existing checkpoints)")
 
     # Train
     print("\nStarting training...")

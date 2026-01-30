@@ -222,3 +222,4 @@ curriculum:
 device: auto  # auto, cuda, cpu
 seed: 42
 deterministic: false
+fresh_start: false  # Set to true to ignore existing checkpoints
