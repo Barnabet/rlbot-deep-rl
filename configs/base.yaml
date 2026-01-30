@@ -122,7 +122,7 @@ ppo:
   gae_lambda: 0.95
   clip_epsilon: 0.2
 
-  entropy_coef: 0.001         # Lower entropy to not dominate value loss
+  entropy_coef: 0.01          # Higher entropy to prevent policy collapse
   value_coef: 0.5
 
   n_epochs: 4                 # Fewer epochs with larger batches
@@ -155,7 +155,7 @@ rewards:
   # Ball interaction - these should dominate early training
   touch_velocity: 1.0                    # High early (learn to touch!), normalize later
   velocity_ball_to_goal: 1.0             # Reward ball moving toward goal
-  speed_toward_ball: 0.05                 # High early (learn to reach ball), fade later
+  speed_toward_ball: 0.5                  # Strong signal to approach ball
 
   # Scoring
   goal: 50.0                             # Big spike when scoring
@@ -164,14 +164,14 @@ rewards:
   save_boost: 0.0                        # DISABLED: was dominating without ball interaction
 
   # Mechanics
-  demo: 1.0                              # Constant: moderate demo reward
+  demo: 0.1                              # Constant: moderate demo reward
   aerial_height: 0.0                     # Disabled: no aerial reward
 
   # Team play (disabled for now)
   team_spacing_penalty: 0.0              # Disabled
 
   # Grounded reward
-  on_ground: 0.01                        # DISABLED: focus on ball first
+  on_ground: 0.0                         # DISABLED: focus on ball first
 
   # Team spirit schedule
   team_spirit: 0.0
