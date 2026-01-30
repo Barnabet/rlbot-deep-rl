@@ -6,12 +6,13 @@ environment:
   timeout_seconds: 300
 
 training:
-  n_workers: 32
+  n_workers: 16
   n_envs_per_worker: 4
 
 ppo:
-  batch_size: 100_000
-  minibatch_size: 25_000
+  batch_size: 50_000
+  minibatch_size: 10_000
+  n_epochs: 10
 
 rewards:
   team_spirit: 0.0

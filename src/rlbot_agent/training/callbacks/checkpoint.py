@@ -35,18 +35,23 @@ class CheckpointCallback:
         step: int,
         trainer: Any,
         metrics: Optional[dict] = None,
-    ) -> None:
+    ) -> Optional[str]:
         """Called after each training step.
 
         Args:
             step: Current global step
             trainer: PPO trainer instance
             metrics: Training metrics
+
+        Returns:
+            Path to saved checkpoint if one was saved, None otherwise
         """
         if step - self._last_save_step >= self.save_interval:
-            self.save_checkpoint(step, trainer, metrics)
+            checkpoint_path = self.save_checkpoint(step, trainer, metrics)
             self._last_save_step = step
             self._cleanup_old_checkpoints()
+            return checkpoint_path
+        return None
 
     def save_checkpoint(
         self,

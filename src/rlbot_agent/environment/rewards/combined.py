@@ -20,6 +20,19 @@ class CombinedReward(BaseReward):
     - Per-reward normalization options
     """
 
+    # Map class names to config field names
+    CLASS_TO_CONFIG = {
+        'TouchVelocity': 'touch_velocity',
+        'VelocityBallToGoal': 'velocity_ball_to_goal',
+        'SpeedTowardBall': 'speed_toward_ball',
+        'GoalReward': 'goal',
+        'SaveBoost': 'save_boost',
+        'DemoReward': 'demo',
+        'AerialHeight': 'aerial_height',
+        'TeamSpacing': 'team_spacing_penalty',
+        'OnGround': 'on_ground',
+    }
+
     def __init__(
         self,
         rewards: List[Tuple[BaseReward, float]],
@@ -38,40 +51,28 @@ class CombinedReward(BaseReward):
         self.config = config or RewardConfig()
         self.normalize = normalize
 
-        # Annealing state
-        self._initial_weights = [w for _, w in rewards]
-        self._target_weights: Optional[List[float]] = None
+        # Store reward names for config lookup
+        self._reward_names = [r.__class__.__name__ for r, _ in rewards]
 
         # Running statistics for normalization
         self._reward_means = [0.0] * len(rewards)
         self._reward_vars = [1.0] * len(rewards)
         self._reward_count = 0
 
-    def set_target_weights(self, weights: List[float]) -> None:
-        """Set target weights for annealing.
-
-        Args:
-            weights: Target weights to anneal toward
-        """
-        assert len(weights) == len(self.rewards)
-        self._target_weights = weights
-
     def set_global_step(self, step: int) -> None:
-        """Update global step and anneal weights accordingly."""
+        """Update global step and interpolate weights from config."""
         super().set_global_step(step)
 
-        # Update child rewards
-        for reward, _ in self.rewards:
+        # Update child rewards and their weights from config schedule
+        for i, (reward, _) in enumerate(self.rewards):
             reward.set_global_step(step)
 
-        # Anneal weights if targets are set
-        if self._target_weights is not None:
-            progress = min(1.0, step / self.config.anneal_steps)
-            for i, ((reward, _), initial, target) in enumerate(
-                zip(self.rewards, self._initial_weights, self._target_weights)
-            ):
-                current_weight = initial + progress * (target - initial)
-                self.rewards[i] = (reward, current_weight)
+            # Get interpolated weight from config
+            class_name = self._reward_names[i]
+            config_name = self.CLASS_TO_CONFIG.get(class_name)
+            if config_name:
+                weight = self.config.get_weight(config_name, step)
+                self.rewards[i] = (reward, weight)
 
     def set_team_spirit(self, team_spirit: float) -> None:
         """Set team spirit for all child rewards."""
@@ -103,10 +104,23 @@ class CombinedReward(BaseReward):
         total_reward = 0.0
         individual_rewards = []
 
+        # Cache per-player breakdown for get_individual_rewards()
+        # Use player.car_id as key to support multi-agent
+        player_id = getattr(player, 'car_id', id(player))
+        if not hasattr(self, '_last_individual_rewards'):
+            self._last_individual_rewards = {}
+        self._last_individual_rewards[player_id] = {}
+
         for reward, weight in self.rewards:
             r = reward.get_reward(player, state, previous_action)
             individual_rewards.append(r)
             total_reward += weight * r
+
+            # Cache for breakdown logging
+            name = reward.__class__.__name__
+            self._last_individual_rewards[player_id][f"{name}/raw"] = r
+            self._last_individual_rewards[player_id][f"{name}/weighted"] = weight * r
+            self._last_individual_rewards[player_id][f"{name}/weight"] = weight
 
         # Update normalization statistics if enabled
         if self.normalize:
@@ -122,24 +136,29 @@ class CombinedReward(BaseReward):
     ) -> Dict[str, float]:
         """Get individual reward values for logging.
 
+        Returns cached values from get_reward() to avoid double-calling
+        stateful rewards (which would return 0 on second call).
+
         Args:
             player: Player data
-            state: Current game state
-            previous_action: Previous action taken
+            state: Current game state (unused, for API compat)
+            previous_action: Previous action taken (unused, for API compat)
 
         Returns:
             Dictionary mapping reward names to values
         """
+        player_id = getattr(player, 'car_id', id(player))
+        if hasattr(self, '_last_individual_rewards') and player_id in self._last_individual_rewards:
+            return self._last_individual_rewards[player_id]
+
+        # Fallback: compute fresh (shouldn't happen if get_reward was called first)
         result = {}
-        for (reward, weight), r in zip(
-            self.rewards,
-            [reward.get_reward(player, state, previous_action) for reward, _ in self.rewards]
-        ):
+        for reward, weight in self.rewards:
+            r = reward.get_reward(player, state, previous_action)
             name = reward.__class__.__name__
             result[f"{name}/raw"] = r
             result[f"{name}/weighted"] = weight * r
             result[f"{name}/weight"] = weight
-
         return result
 
     def get_team_reward(

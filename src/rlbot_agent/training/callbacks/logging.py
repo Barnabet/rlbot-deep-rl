@@ -81,19 +81,12 @@ class LoggingCallback:
         metrics['time/steps_per_second'] = sps
         metrics['time/total_hours'] = elapsed / 3600
 
-        # Console output
-        print(f"\n{'='*60}")
-        print(f"Step: {step:,}")
-        print(f"{'='*60}")
-
-        for key, value in sorted(metrics.items()):
-            if isinstance(value, float):
-                print(f"  {key}: {value:.4f}")
-            else:
-                print(f"  {key}: {value}")
-
-        print(f"  SPS: {sps:.1f}")
-        print(f"{'='*60}\n")
+        # Minimal console output - just key metrics on one line
+        reward = metrics.get('env/avg_episode_reward', 0)
+        air_pct = metrics.get('env/air_pct', 0)
+        ep_len = metrics.get('env/avg_episode_length', 0)
+        ev = metrics.get('train/explained_variance', 0)
+        print(f"[{step:,}] reward={reward:.1f} air={air_pct:.1f}% len={ep_len:.0f} ev={ev:.2f} sps={sps:.0f}")
 
         # WandB logging
         if self._wandb_run is not None:

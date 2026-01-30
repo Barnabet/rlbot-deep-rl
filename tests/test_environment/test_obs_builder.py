@@ -27,13 +27,14 @@ class TestAdvancedObsBuilder:
         builder = AdvancedObsBuilder(config=obs_config, max_players=6)
 
         expected_size = (
-            obs_config.self_car_dim  # 19
-            + obs_config.ball_dim  # 15
+            obs_config.self_car_dim  # 24 (with goal features + velocity magnitude)
+            + obs_config.ball_dim  # 19 (with goal features + velocity magnitude)
             + 5 * obs_config.other_car_dim  # 5 * 14 = 70
         )
 
         assert builder.get_obs_space_size() == expected_size
-        assert builder.get_obs_space_size() == 104
+        # Total: 24 + 19 + 70 = 113
+        assert builder.get_obs_space_size() == 113
 
     def test_position_normalization(self, obs_config):
         """Test position normalization."""
@@ -104,12 +105,15 @@ class TestObsBuilderConfig:
     """Tests for observation configuration."""
 
     def test_default_dims(self):
-        """Test default dimension values."""
+        """Test default dimension values (with goal features + velocity magnitudes)."""
         config = ObservationConfig()
 
-        assert config.self_car_dim == 19
+        # New dimensions include goal features and velocity magnitudes:
+        # self_car: 19 base + 1 speed + 4 goal features = 24
+        # ball: 15 base + 1 speed + 3 goal features = 19
+        assert config.self_car_dim == 24
         assert config.other_car_dim == 14
-        assert config.ball_dim == 15
+        assert config.ball_dim == 19
 
     def test_custom_config(self):
         """Test custom configuration."""

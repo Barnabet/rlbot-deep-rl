@@ -26,6 +26,7 @@ class Learner:
         n_actions: int = 1944,
         max_players: int = 6,
         device: Optional[str] = None,
+        use_multi_discrete: bool = True,
     ):
         """Initialize the learner.
 
@@ -36,6 +37,7 @@ class Learner:
             n_actions: Number of discrete actions
             max_players: Maximum number of players
             device: PyTorch device ('cuda', 'cpu', or None for auto)
+            use_multi_discrete: Use 8 independent action heads (True) or flat 1944 (False)
         """
         # Set device
         if device is None or device == "auto":
@@ -44,6 +46,7 @@ class Learner:
             self.device = torch.device(device)
 
         print(f"Learner using device: {self.device}")
+        print(f"Action space: {'multi-discrete (21 logits)' if use_multi_discrete else 'flat (1944 logits)'}")
 
         # Create model
         self.model = ActorAttentionCritic(
@@ -51,6 +54,7 @@ class Learner:
             network_config=network_config,
             n_actions=n_actions,
             max_players=max_players,
+            use_multi_discrete=use_multi_discrete,
         ).to(self.device)
 
         # Create PPO trainer

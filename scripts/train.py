@@ -19,6 +19,9 @@ from rlbot_agent.core.config import (
     TrainingConfig,
     EncoderConfig,
     AttentionConfig,
+    LSTMConfig,
+    CurriculumConfig,
+    CurriculumPhase,
 )
 from rlbot_agent.environment import create_environment
 from rlbot_agent.environment.rewards import CombinedReward
@@ -42,6 +45,7 @@ def config_to_dataclass(cfg: DictConfig) -> dict:
         team_size=cfg.environment.team_size,
         gravity=cfg.environment.gravity,
         boost_consumption=cfg.environment.boost_consumption,
+        episode_steps=cfg.environment.episode_steps,  # Fixed episode length
         terminal_conditions=tuple(cfg.environment.terminal_conditions),
         timeout_seconds=cfg.environment.timeout_seconds,
         no_touch_timeout_seconds=cfg.environment.no_touch_timeout_seconds,
@@ -76,10 +80,17 @@ def config_to_dataclass(cfg: DictConfig) -> dict:
         ff_dim=cfg.network.attention.ff_dim,
         dropout=cfg.network.attention.dropout,
     )
+    lstm = LSTMConfig(
+        use_lstm=cfg.network.lstm.use_lstm,
+        hidden_size=cfg.network.lstm.hidden_size,
+        num_layers=cfg.network.lstm.num_layers,
+        sequence_length=cfg.network.lstm.sequence_length,
+    )
     network_config = NetworkConfig(
         car_encoder=car_encoder,
         ball_encoder=ball_encoder,
         attention=attention,
+        lstm=lstm,
         policy_hidden_dims=tuple(cfg.network.policy_head.hidden_dims),
         policy_activation=cfg.network.policy_head.activation,
         value_hidden_dims=tuple(cfg.network.value_head.hidden_dims),
@@ -91,6 +102,7 @@ def config_to_dataclass(cfg: DictConfig) -> dict:
         learning_rate=cfg.ppo.learning_rate,
         lr_end=cfg.ppo.lr_end,
         lr_anneal_steps=cfg.ppo.lr_anneal_steps,
+        lr_warmup_steps=cfg.ppo.get('lr_warmup_steps', 3),
         batch_size=cfg.ppo.batch_size,
         minibatch_size=cfg.ppo.minibatch_size,
         experience_buffer_size=cfg.ppo.experience_buffer_size,
@@ -104,17 +116,27 @@ def config_to_dataclass(cfg: DictConfig) -> dict:
         normalize_advantages=cfg.ppo.normalize_advantages,
     )
 
-    # Reward config
+    # Reward config - convert lists to tuples for schedule support
+    def parse_weight(val):
+        """Convert YAML value to weight (float or tuple)."""
+        # OmegaConf returns ListConfig for lists
+        if hasattr(val, '__iter__') and not isinstance(val, str):
+            val_list = list(val)
+            if len(val_list) == 2:
+                return (float(val_list[0]), float(val_list[1]))
+        return float(val)
+
     reward_config = RewardConfig(
-        touch_velocity=cfg.rewards.touch_velocity,
-        velocity_ball_to_goal=cfg.rewards.velocity_ball_to_goal,
-        speed_toward_ball=cfg.rewards.speed_toward_ball,
-        goal=cfg.rewards.goal,
-        save_boost=cfg.rewards.save_boost,
-        demo=cfg.rewards.demo,
-        aerial_height=cfg.rewards.aerial_height,
-        team_spacing_penalty=cfg.rewards.team_spacing_penalty,
-        anneal_steps=cfg.rewards.anneal_steps,
+        touch_velocity=parse_weight(cfg.rewards.touch_velocity),
+        velocity_ball_to_goal=parse_weight(cfg.rewards.velocity_ball_to_goal),
+        speed_toward_ball=parse_weight(cfg.rewards.speed_toward_ball),
+        goal=parse_weight(cfg.rewards.goal),
+        save_boost=parse_weight(cfg.rewards.save_boost),
+        demo=parse_weight(cfg.rewards.demo),
+        aerial_height=parse_weight(cfg.rewards.aerial_height),
+        team_spacing_penalty=parse_weight(cfg.rewards.team_spacing_penalty),
+        on_ground=parse_weight(cfg.rewards.get('on_ground', 0.0)),
+        schedule_steps=cfg.rewards.get('schedule_steps', 5_000_000_000),
         team_spirit=cfg.rewards.team_spirit,
         team_spirit_end=cfg.rewards.team_spirit_end,
     )
@@ -136,6 +158,24 @@ def config_to_dataclass(cfg: DictConfig) -> dict:
         deterministic=cfg.deterministic,
     )
 
+    # Curriculum config
+    curriculum_config = None
+    if hasattr(cfg, 'curriculum') and cfg.curriculum.enabled:
+        curriculum_phases = []
+        for phase in cfg.curriculum.phases:
+            curriculum_phases.append(CurriculumPhase(
+                name=phase.name,
+                end_step=phase.end_step,
+                rewards=list(phase.rewards),
+                team_size=phase.get('team_size', 1),
+                team_spirit=phase.get('team_spirit', 0.0),
+                use_historical_checkpoints=phase.get('use_historical_checkpoints', False),
+            ))
+        curriculum_config = CurriculumConfig(
+            enabled=cfg.curriculum.enabled,
+            phases=curriculum_phases,
+        )
+
     return {
         'env': env_config,
         'obs': obs_config,
@@ -143,6 +183,7 @@ def config_to_dataclass(cfg: DictConfig) -> dict:
         'ppo': ppo_config,
         'reward': reward_config,
         'training': training_config,
+        'curriculum': curriculum_config,
     }
 
 
@@ -153,13 +194,8 @@ def main(cfg: DictConfig) -> None:
     Args:
         cfg: Hydra configuration
     """
-    print("=" * 60)
     print("RL Rocket League Bot - Training")
-    print("=" * 60)
-
-    # Print configuration
-    print("\nConfiguration:")
-    print(OmegaConf.to_yaml(cfg))
+    print("-" * 40)
 
     # Convert to dataclasses
     configs = config_to_dataclass(cfg)
@@ -174,20 +210,51 @@ def main(cfg: DictConfig) -> None:
         DemoReward,
         AerialHeight,
         TeamSpacing,
+        OnGround,
     )
 
     reward_config = configs['reward']
+
+    # Initial weights (start values for scheduled rewards)
+    def get_initial_weight(val):
+        """Get initial weight (start value for tuples)."""
+        if isinstance(val, tuple):
+            return val[0]
+        return val
+
     rewards = [
-        (TouchVelocity(), reward_config.touch_velocity),
-        (VelocityBallToGoal(), reward_config.velocity_ball_to_goal),
-        (SpeedTowardBall(), reward_config.speed_toward_ball),
-        (GoalReward(), reward_config.goal),
-        (SaveBoost(), reward_config.save_boost),
-        (DemoReward(), reward_config.demo),
-        (AerialHeight(), reward_config.aerial_height),
-        (TeamSpacing(), reward_config.team_spacing_penalty),
+        (TouchVelocity(), get_initial_weight(reward_config.touch_velocity)),
+        (VelocityBallToGoal(), get_initial_weight(reward_config.velocity_ball_to_goal)),
+        (SpeedTowardBall(), get_initial_weight(reward_config.speed_toward_ball)),
+        (GoalReward(), get_initial_weight(reward_config.goal)),
+        (SaveBoost(), get_initial_weight(reward_config.save_boost)),
+        (DemoReward(), get_initial_weight(reward_config.demo)),
+        (AerialHeight(), get_initial_weight(reward_config.aerial_height)),
+        (TeamSpacing(), get_initial_weight(reward_config.team_spacing_penalty)),
+        (OnGround(), get_initial_weight(reward_config.on_ground)),
     ]
     reward_fn = CombinedReward(rewards=rewards, config=reward_config)
+
+    # Print reward schedule
+    print(f"\nReward schedule (over {reward_config.schedule_steps:,} steps):")
+    reward_names = [
+        ('TouchVelocity', reward_config.touch_velocity),
+        ('VelocityBallToGoal', reward_config.velocity_ball_to_goal),
+        ('SpeedTowardBall', reward_config.speed_toward_ball),
+        ('GoalReward', reward_config.goal),
+        ('SaveBoost', reward_config.save_boost),
+        ('DemoReward', reward_config.demo),
+        ('AerialHeight', reward_config.aerial_height),
+        ('TeamSpacing', reward_config.team_spacing_penalty),
+        ('OnGround', reward_config.on_ground),
+    ]
+    for name, weight in reward_names:
+        if isinstance(weight, tuple):
+            print(f"  {name}: {weight[0]} → {weight[1]}")
+        elif weight != 0:
+            print(f"  {name}: {weight} (constant)")
+        else:
+            print(f"  {name}: off")
 
     # Create coordinator
     coordinator = TrainingCoordinator(
@@ -197,6 +264,8 @@ def main(cfg: DictConfig) -> None:
         ppo_config=configs['ppo'],
         training_config=configs['training'],
         reward_fn=reward_fn,
+        reward_config=configs['reward'],
+        curriculum_config=configs['curriculum'],
     )
 
     # Resume from checkpoint if available

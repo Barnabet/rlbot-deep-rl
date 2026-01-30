@@ -105,7 +105,7 @@ class AdvancedObsBuilder(BaseObsBuilder):
     ) -> NDArray[np.float32]:
         """Build observation for self car.
 
-        Returns 19-dimensional vector:
+        Returns 24-dimensional vector:
         - Position (3): normalized x, y, z
         - Velocity (3): normalized vx, vy, vz
         - Angular velocity (3): normalized wx, wy, wz
@@ -114,6 +114,11 @@ class AdvancedObsBuilder(BaseObsBuilder):
         - On ground (1): binary
         - Has flip (1): binary
         - Demo timer (1): 0-3 seconds normalized
+        - Speed (1): L2 norm of velocity / MAX_SPEED
+        - Own goal distance (1): normalized distance to own goal
+        - Own goal angle (1): sin of angle to own goal in local frame
+        - Enemy goal distance (1): normalized distance to enemy goal
+        - Enemy goal angle (1): sin of angle to enemy goal in local frame
         """
         car = player.car_data
 
@@ -126,8 +131,11 @@ class AdvancedObsBuilder(BaseObsBuilder):
         # Angular velocity - normalized
         ang_vel = self._normalize_angular_velocity(car.angular_velocity, flip)
 
-        # Rotation as sin/cos
-        rot = self._rotation_to_sincos(car.pitch(), car.yaw(), car.roll(), flip)
+        # Rotation as sin/cos (pitch/yaw/roll are properties in RLGym v2)
+        pitch = car.pitch() if callable(car.pitch) else car.pitch
+        yaw = car.yaw() if callable(car.yaw) else car.yaw
+        roll = car.roll() if callable(car.roll) else car.roll
+        rot = self._rotation_to_sincos(pitch, yaw, roll, flip)
 
         # Other state
         boost = player.boost_amount / 100.0
@@ -135,8 +143,15 @@ class AdvancedObsBuilder(BaseObsBuilder):
         has_flip = float(player.has_flip)
         demo_timer = player.demo_respawn_timer / 3.0 if hasattr(player, 'demo_respawn_timer') else 0.0
 
+        # Speed magnitude (L2 norm)
+        speed = np.linalg.norm(car.linear_velocity) / self.MAX_SPEED
+
+        # Goal features
+        goal_features = self._compute_goal_features(car, flip)
+
         return np.array(
-            [*pos, *vel, *ang_vel, *rot, boost, on_ground, has_flip, demo_timer],
+            [*pos, *vel, *ang_vel, *rot, boost, on_ground, has_flip, demo_timer,
+             speed, *goal_features],
             dtype=np.float32,
         )
 
@@ -148,12 +163,16 @@ class AdvancedObsBuilder(BaseObsBuilder):
     ) -> NDArray[np.float32]:
         """Build observation for ball relative to player.
 
-        Returns 15-dimensional vector:
+        Returns 19-dimensional vector:
         - Absolute position (3): normalized
         - Absolute velocity (3): normalized
         - Angular velocity (3): normalized
         - Relative position in car's local frame (3)
         - Relative velocity in car's local frame (3)
+        - Ball speed (1): L2 norm of velocity / MAX_SPEED
+        - Ball to own goal distance (1): normalized
+        - Ball to enemy goal distance (1): normalized
+        - Ball to enemy goal angle (1): sin of angle from car's perspective
         """
         car = player.car_data
 
@@ -175,8 +194,30 @@ class AdvancedObsBuilder(BaseObsBuilder):
         local_rel_pos = local_rel_pos / np.array([self.FIELD_X, self.FIELD_Y, self.FIELD_Z])
         local_rel_vel = local_rel_vel / self.MAX_SPEED
 
+        # Ball speed magnitude
+        ball_speed = np.linalg.norm(ball.linear_velocity) / self.MAX_SPEED
+
+        # Ball-to-goal features
+        ball_world_pos = ball.position.copy()
+        if flip:
+            ball_world_pos[0] = -ball_world_pos[0]
+            ball_world_pos[1] = -ball_world_pos[1]
+
+        own_goal = np.array([0.0, -self.GOAL_Y, 0.0])
+        enemy_goal = np.array([0.0, self.GOAL_Y, 0.0])
+
+        max_dist = 2.0 * self.FIELD_Y
+        ball_to_own_dist = np.linalg.norm(ball_world_pos - own_goal) / max_dist
+        ball_to_enemy_dist = np.linalg.norm(ball_world_pos - enemy_goal) / max_dist
+
+        # Angle from car to ball-to-enemy-goal vector
+        ball_to_enemy_vec = enemy_goal - ball_world_pos
+        ball_to_enemy_local = rotation_matrix @ ball_to_enemy_vec
+        ball_to_enemy_angle = np.arctan2(ball_to_enemy_local[1], ball_to_enemy_local[0])
+
         return np.array(
-            [*ball_pos, *ball_vel, *ball_ang_vel, *local_rel_pos, *local_rel_vel],
+            [*ball_pos, *ball_vel, *ball_ang_vel, *local_rel_pos, *local_rel_vel,
+             ball_speed, ball_to_own_dist, ball_to_enemy_dist, np.sin(ball_to_enemy_angle)],
             dtype=np.float32,
         )
 
@@ -255,10 +296,11 @@ class AdvancedObsBuilder(BaseObsBuilder):
         local_rel_pos = local_rel_pos / np.array([self.FIELD_X, self.FIELD_Y, self.FIELD_Z])
         local_rel_vel = local_rel_vel / self.MAX_SPEED
 
-        # Other car's rotation
-        rot = self._rotation_to_sincos(
-            other_car.pitch(), other_car.yaw(), other_car.roll(), flip
-        )
+        # Other car's rotation (properties in RLGym v2)
+        pitch = other_car.pitch() if callable(getattr(other_car, 'pitch', None)) else other_car.pitch
+        yaw = other_car.yaw() if callable(getattr(other_car, 'yaw', None)) else other_car.yaw
+        roll = other_car.roll() if callable(getattr(other_car, 'roll', None)) else other_car.roll
+        rot = self._rotation_to_sincos(pitch, yaw, roll, flip)
 
         # Boost and team
         boost = other_player.boost_amount / 100.0
@@ -317,10 +359,10 @@ class AdvancedObsBuilder(BaseObsBuilder):
 
     def _get_rotation_matrix(self, car: Any, flip: bool) -> NDArray[np.float32]:
         """Get rotation matrix to transform from world to car's local frame."""
-        # Get car's forward, right, up vectors
-        forward = car.forward()
-        right = car.right()
-        up = car.up()
+        # Get car's forward, right, up vectors (properties in RLGym v2)
+        forward = car.forward() if callable(getattr(car, 'forward', None)) else car.forward
+        right = car.right() if callable(getattr(car, 'right', None)) else car.right
+        up = car.up() if callable(getattr(car, 'up', None)) else car.up
 
         if flip:
             forward = -forward
@@ -329,3 +371,49 @@ class AdvancedObsBuilder(BaseObsBuilder):
 
         # Rotation matrix: rows are the car's axes
         return np.array([forward, right, up], dtype=np.float32)
+
+    def _compute_goal_features(
+        self, car: Any, flip: bool
+    ) -> NDArray[np.float32]:
+        """Compute goal-oriented features for the car.
+
+        Returns 4 values:
+        - Own goal distance (normalized)
+        - Own goal angle (sin of angle in local frame)
+        - Enemy goal distance (normalized)
+        - Enemy goal angle (sin of angle in local frame)
+        """
+        car_pos = car.position.copy()
+        if flip:
+            car_pos[0] = -car_pos[0]
+            car_pos[1] = -car_pos[1]
+
+        # Goal positions (blue team perspective after flip normalization)
+        # Own goal at Y = -GOAL_Y, enemy goal at Y = +GOAL_Y
+        own_goal = np.array([0.0, -self.GOAL_Y, 0.0])
+        enemy_goal = np.array([0.0, self.GOAL_Y, 0.0])
+
+        # Vectors from car to goals
+        own_goal_vec = own_goal - car_pos
+        enemy_goal_vec = enemy_goal - car_pos
+
+        # Distances (normalized by 2*FIELD_Y for reasonable scale)
+        max_dist = 2.0 * self.FIELD_Y
+        own_goal_dist = np.linalg.norm(own_goal_vec) / max_dist
+        enemy_goal_dist = np.linalg.norm(enemy_goal_vec) / max_dist
+
+        # Transform to car's local frame for angle computation
+        rotation_matrix = self._get_rotation_matrix(car, flip)
+        own_goal_local = rotation_matrix @ own_goal_vec
+        enemy_goal_local = rotation_matrix @ enemy_goal_vec
+
+        # Angle from car's forward direction (atan2 gives angle in XY plane)
+        # Using sin of angle for smooth representation
+        own_goal_angle = np.arctan2(own_goal_local[1], own_goal_local[0])
+        enemy_goal_angle = np.arctan2(enemy_goal_local[1], enemy_goal_local[0])
+
+        return np.array(
+            [own_goal_dist, np.sin(own_goal_angle),
+             enemy_goal_dist, np.sin(enemy_goal_angle)],
+            dtype=np.float32,
+        )

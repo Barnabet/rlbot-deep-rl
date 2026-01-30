@@ -131,6 +131,149 @@ class CategoricalDistribution(nn.Module):
         return torch.distributions.kl_divergence(dist_old, dist_new)
 
 
+class MultiDiscreteDistribution(nn.Module):
+    """Multi-head discrete distribution for independent action dimensions.
+
+    Instead of 1944 actions, outputs 8 independent distributions:
+    - 5 continuous controls (throttle, steer, pitch, yaw, roll): 3 options each
+    - 3 binary controls (jump, boost, handbrake): 2 options each
+
+    Total: 3+3+3+3+3+2+2+2 = 21 logits instead of 1944
+    """
+
+    # Action dimensions: [throttle, steer, pitch, yaw, roll, jump, boost, handbrake]
+    ACTION_DIMS = (3, 3, 3, 3, 3, 2, 2, 2)
+    TOTAL_LOGITS = sum(ACTION_DIMS)  # 21
+
+    def __init__(self):
+        super().__init__()
+        self.action_dims = self.ACTION_DIMS
+        self.n_heads = len(self.action_dims)
+
+        # Precompute split indices
+        self.split_sizes = list(self.action_dims)
+
+    def _split_logits(self, logits: torch.Tensor) -> list:
+        """Split flat logits into per-head logits."""
+        return torch.split(logits, self.split_sizes, dim=-1)
+
+    def sample(
+        self,
+        logits: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+        deterministic: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample actions from all heads.
+
+        Args:
+            logits: [batch, 21] flat logits
+            action_mask: Not used (kept for API compatibility)
+            deterministic: If True, return mode
+
+        Returns:
+            action: [batch, 8] action indices per head
+            log_prob: [batch] sum of log probs
+            entropy: [batch] sum of entropies
+        """
+        head_logits = self._split_logits(logits)
+
+        actions = []
+        log_probs = []
+        entropies = []
+
+        for head_idx, h_logits in enumerate(head_logits):
+            dist = Categorical(logits=h_logits)
+
+            if deterministic:
+                action = dist.probs.argmax(dim=-1)
+            else:
+                action = dist.sample()
+
+            actions.append(action)
+            log_probs.append(dist.log_prob(action))
+            entropies.append(dist.entropy())
+
+        # Stack actions, sum log_probs and entropies
+        actions = torch.stack(actions, dim=-1)  # [batch, 8]
+        total_log_prob = torch.stack(log_probs, dim=-1).sum(dim=-1)  # [batch]
+        total_entropy = torch.stack(entropies, dim=-1).sum(dim=-1)  # [batch]
+
+        return actions, total_log_prob, total_entropy
+
+    def log_prob(
+        self,
+        logits: torch.Tensor,
+        actions: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Calculate log probability of multi-discrete actions.
+
+        Args:
+            logits: [batch, 21] flat logits
+            actions: [batch, 8] action indices per head
+
+        Returns:
+            [batch] sum of log probs
+        """
+        head_logits = self._split_logits(logits)
+
+        log_probs = []
+        for head_idx, h_logits in enumerate(head_logits):
+            dist = Categorical(logits=h_logits)
+            log_probs.append(dist.log_prob(actions[..., head_idx]))
+
+        return torch.stack(log_probs, dim=-1).sum(dim=-1)
+
+    def entropy(
+        self,
+        logits: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Calculate average entropy across all heads.
+
+        We use MEAN instead of SUM because:
+        - With sum, it's "easy" to maintain high entropy (each head just stays uniform)
+        - With mean, entropy reflects per-decision uncertainty
+        - This makes entropy_coef comparable to flat action spaces
+
+        Args:
+            logits: [batch, 21] flat logits
+
+        Returns:
+            [batch] mean entropy per head
+        """
+        head_logits = self._split_logits(logits)
+
+        entropies = []
+        for h_logits in head_logits:
+            dist = Categorical(logits=h_logits)
+            entropies.append(dist.entropy())
+
+        return torch.stack(entropies, dim=-1).mean(dim=-1)
+
+    def get_head_probs(self, logits: torch.Tensor) -> dict:
+        """Get per-head probabilities for logging.
+
+        Returns dict with jump_prob, boost_prob, etc.
+        """
+        head_logits = self._split_logits(logits)
+        head_names = ['throttle', 'steer', 'pitch', 'yaw', 'roll', 'jump', 'boost', 'handbrake']
+
+        result = {}
+        for name, h_logits in zip(head_names, head_logits):
+            probs = F.softmax(h_logits, dim=-1)
+            if probs.shape[-1] == 2:
+                # Binary: return prob of action=1
+                result[f'{name}_prob'] = probs[..., 1].mean().item()
+            else:
+                # 3-way: return prob of each
+                result[f'{name}_neg_prob'] = probs[..., 0].mean().item()
+                result[f'{name}_zero_prob'] = probs[..., 1].mean().item()
+                result[f'{name}_pos_prob'] = probs[..., 2].mean().item()
+
+        return result
+
+
 class MaskedCategorical(Categorical):
     """Categorical distribution with built-in masking."""
 

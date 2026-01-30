@@ -13,18 +13,15 @@ class GoalReward(BaseReward):
     """Reward for scoring/conceding goals.
 
     +1 for scoring, -1 for conceding.
+    Uses RLGym 2.0's goal_scored and scoring_team attributes.
     """
 
     def __init__(self, weight: float = 100.0):
         super().__init__(weight)
-        self._prev_scores: Dict[int, int] = {}
 
     def reset(self, initial_state: Any) -> None:
-        """Reset score tracking."""
-        self._prev_scores = {
-            0: initial_state.blue_score if hasattr(initial_state, 'blue_score') else 0,
-            1: initial_state.orange_score if hasattr(initial_state, 'orange_score') else 0,
-        }
+        """Reset - nothing to track, we use per-step goal_scored flag."""
+        pass
 
     def get_reward(
         self,
@@ -32,24 +29,21 @@ class GoalReward(BaseReward):
         state: Any,
         previous_action: Any,
     ) -> float:
-        """Calculate goal reward."""
-        # Get current scores
-        blue_score = state.blue_score if hasattr(state, 'blue_score') else 0
-        orange_score = state.orange_score if hasattr(state, 'orange_score') else 0
+        """Calculate goal reward using RLGym 2.0 goal_scored/scoring_team."""
+        # RLGym 2.0 sets goal_scored=True and scoring_team=0/1 when goal occurs
+        goal_scored = getattr(state, 'goal_scored', False)
+        if not goal_scored:
+            return 0.0
 
-        # Calculate score changes
-        blue_delta = blue_score - self._prev_scores.get(0, 0)
-        orange_delta = orange_score - self._prev_scores.get(1, 0)
+        scoring_team = getattr(state, 'scoring_team', None)
+        if scoring_team is None:
+            return 0.0
 
-        # Update tracked scores
-        self._prev_scores[0] = blue_score
-        self._prev_scores[1] = orange_score
-
-        # Determine reward based on team
-        if player.team_num == 0:  # Blue team
-            return float(blue_delta - orange_delta)
-        else:  # Orange team
-            return float(orange_delta - blue_delta)
+        # +1 for own team scoring, -1 for opponent scoring
+        if scoring_team == player.team_num:
+            return 1.0
+        else:
+            return -1.0
 
 
 @registry.register("reward", "save")

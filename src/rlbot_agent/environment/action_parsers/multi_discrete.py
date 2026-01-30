@@ -101,13 +101,47 @@ class MultiDiscreteActionParser(BaseActionParser):
         """Convert discrete action indices to controller inputs.
 
         Args:
-            actions: Array of action indices, shape (n_agents,)
+            actions: Array of action indices, shape (n_agents,) for flat actions
+                    or (n_agents, 8) for multi-discrete actions
             state: Current game state (unused, masking done separately)
 
         Returns:
             Array of controller inputs, shape (n_agents, 8)
         """
-        return self._action_table[actions]
+        actions = np.asarray(actions)
+        if actions.ndim == 2 and actions.shape[-1] == 8:
+            # Multi-discrete: convert 8 indices to controller values
+            return self.parse_multi_discrete(actions)
+        else:
+            # Flat: lookup in action table
+            return self._action_table[actions]
+
+    def parse_multi_discrete(
+        self, actions: NDArray[np.int64]
+    ) -> NDArray[np.float32]:
+        """Convert multi-discrete action indices to controller inputs.
+
+        Args:
+            actions: Array of action indices per head, shape (n_agents, 8)
+                    Each column is [throttle, steer, pitch, yaw, roll, jump, boost, handbrake]
+                    Continuous controls: index 0=-1, 1=0, 2=1
+                    Binary controls: index 0=0, 1=1
+
+        Returns:
+            Array of controller inputs, shape (n_agents, 8)
+        """
+        n_agents = actions.shape[0]
+        result = np.zeros((n_agents, 8), dtype=np.float32)
+
+        # Continuous controls: map 0,1,2 -> -1,0,1
+        for i in range(5):
+            result[:, i] = actions[:, i].astype(np.float32) - 1.0
+
+        # Binary controls: map 0,1 -> 0,1
+        for i in range(5, 8):
+            result[:, i] = actions[:, i].astype(np.float32)
+
+        return result
 
     def get_action_mask(
         self, player: Any, state: Any

@@ -197,7 +197,7 @@ class FaceBall(BaseReward):
 
         ball_dir = to_ball / distance
 
-        # Car's forward direction
-        forward = np.array(car.forward())
+        # Car's forward direction (property in RLGym v2)
+        forward = np.array(car.forward() if callable(getattr(car, 'forward', None)) else car.forward)
 
         return np.dot(forward, ball_dir)

@@ -51,6 +51,27 @@ class InAir(BaseReward):
         return 0.0 if player.on_ground else 1.0
 
 
+@registry.register("reward", "on_ground")
+class OnGround(BaseReward):
+    """Reward for staying on the ground.
+
+    Returns 1 if on ground, 0 if in air.
+    Positive-only reward to encourage ground control.
+    """
+
+    def __init__(self, weight: float = 1.0):
+        super().__init__(weight)
+
+    def get_reward(
+        self,
+        player: Any,
+        state: Any,
+        previous_action: Any,
+    ) -> float:
+        """Calculate on-ground reward."""
+        return 1.0 if player.on_ground else 0.0
+
+
 @registry.register("reward", "ball_proximity")
 class BallProximity(BaseReward):
     """Reward based on proximity to ball.

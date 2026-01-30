@@ -6,7 +6,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from torch.optim.lr_scheduler import LinearLR
+import warnings
+from torch.optim.lr_scheduler import LinearLR, SequentialLR
 
 from ...core.config import PPOConfig
 from ...core.types import TrainingMetrics
@@ -51,13 +52,37 @@ class PPO:
             eps=1e-5,
         )
 
-        # Learning rate scheduler (linear annealing)
-        self.scheduler = LinearLR(
-            self.optimizer,
-            start_factor=1.0,
-            end_factor=config.lr_end / config.learning_rate,
-            total_iters=config.lr_anneal_steps,
-        )
+        # Learning rate scheduler with warmup then linear annealing
+        # Warmup: 0.01 * LR -> LR over first few updates (prevents extreme first-step dynamics)
+        # Anneal: LR -> lr_end over training
+        warmup_steps = getattr(config, 'lr_warmup_steps', 3)
+
+        if warmup_steps > 0:
+            warmup_scheduler = LinearLR(
+                self.optimizer,
+                start_factor=0.01,  # Start at 1% of LR
+                end_factor=1.0,
+                total_iters=warmup_steps,
+            )
+            anneal_scheduler = LinearLR(
+                self.optimizer,
+                start_factor=1.0,
+                end_factor=config.lr_end / config.learning_rate,
+                total_iters=config.lr_anneal_steps,
+            )
+            self.scheduler = SequentialLR(
+                self.optimizer,
+                schedulers=[warmup_scheduler, anneal_scheduler],
+                milestones=[warmup_steps],
+            )
+        else:
+            # No warmup, just annealing
+            self.scheduler = LinearLR(
+                self.optimizer,
+                start_factor=1.0,
+                end_factor=config.lr_end / config.learning_rate,
+                total_iters=config.lr_anneal_steps,
+            )
 
         # Loss function
         self.loss_fn = PPOLoss(
@@ -101,16 +126,34 @@ class PPO:
         total_rewards = []
         episode_rewards = np.zeros(env.num_envs)
 
+        # Initialize hidden state for LSTM
+        use_lstm = hasattr(self.model, 'use_lstm') and self.model.use_lstm
+        if use_lstm:
+            hidden = self.model.get_initial_hidden(env.num_envs, self.device)
+        else:
+            hidden = None
+
         self.model.eval()
         with torch.no_grad():
             for _ in range(n_steps):
                 # Get action from policy
                 obs_tensor = torch.tensor(obs, device=self.device)
-                action, log_prob, _, value = self.model.get_action(obs_tensor)
+                action, log_prob, _, value, new_hidden = self.model.get_action(
+                    obs_tensor, hidden
+                )
 
                 action = action.cpu().numpy()
                 log_prob = log_prob.cpu().numpy()
                 value = value.cpu().numpy()
+
+                # Store hidden state before updating
+                if use_lstm and hidden is not None:
+                    hidden_np = (
+                        hidden[0].cpu().numpy(),
+                        hidden[1].cpu().numpy(),
+                    )
+                else:
+                    hidden_np = None
 
                 # Environment step
                 next_obs, rewards, next_dones, truncated, infos = env.step(action)
@@ -124,7 +167,17 @@ class PPO:
                     done=dones_float,
                     log_prob=log_prob,
                     value=value,
+                    hidden_state=hidden_np,
                 )
+
+                # Update hidden state
+                if use_lstm:
+                    hidden = new_hidden
+                    # Reset hidden for done environments
+                    for i, done in enumerate(dones_float):
+                        if done > 0.5:
+                            hidden[0][:, i, :] = 0
+                            hidden[1][:, i, :] = 0
 
                 # Track episode rewards
                 episode_rewards += rewards
@@ -142,7 +195,7 @@ class PPO:
         # Compute last values for GAE
         with torch.no_grad():
             last_values = self.model.get_value(
-                torch.tensor(obs, device=self.device)
+                torch.tensor(obs, device=self.device), hidden
             ).cpu().numpy()
 
         # Compute advantages and returns
@@ -174,47 +227,116 @@ class PPO:
         all_clip_fractions = []
         all_approx_kl = []
 
+        # Check if LSTM training mode
+        use_lstm = hasattr(self.model, 'use_lstm') and self.model.use_lstm
+
         for epoch in range(self.config.n_epochs):
-            for batch in buffer.get(self.config.minibatch_size):
-                # Evaluate actions with current policy
-                log_probs, entropy, values = self.model.evaluate_actions(
-                    batch.observations,
-                    batch.actions,
-                    batch.action_masks,
-                )
+            if use_lstm and buffer.lstm_config is not None:
+                # LSTM: Use sequence-based batching
+                seq_len = buffer.lstm_config.sequence_length
+                batch_size = max(1, self.config.minibatch_size // seq_len)
 
-                # Compute loss
-                loss_output = self.loss_fn(
-                    log_probs=log_probs,
-                    old_log_probs=batch.old_log_probs,
-                    values=values,
-                    old_values=batch.old_values,
-                    advantages=batch.advantages,
-                    returns=batch.returns,
-                    entropy=entropy,
-                )
+                for batch in buffer.get_sequences(batch_size, seq_len):
+                    # batch.observations: [batch, seq_len, obs_dim]
+                    # batch.hidden_states: (h, c) each [num_layers, batch, hidden]
 
-                # Backpropagation
-                self.optimizer.zero_grad()
-                loss_output.total_loss.backward()
+                    # Evaluate actions with sequences
+                    log_probs, entropy, values, _ = self.model.evaluate_actions(
+                        batch.observations,
+                        batch.actions,
+                        batch.hidden_states,
+                        batch.action_masks,
+                    )
+                    # log_probs, entropy, values: [batch, seq_len]
 
-                # Gradient clipping
-                nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.max_grad_norm,
-                )
+                    # Apply mask for episode boundaries
+                    mask = batch.masks  # [batch, seq_len]
+                    mask_flat = mask.view(-1)
+                    valid_mask = mask_flat > 0.5
 
-                self.optimizer.step()
+                    # Flatten for loss computation
+                    log_probs_flat = log_probs.view(-1)[valid_mask]
+                    old_log_probs_flat = batch.old_log_probs.view(-1)[valid_mask]
+                    values_flat = values.view(-1)[valid_mask]
+                    old_values_flat = batch.old_values.view(-1)[valid_mask]
+                    advantages_flat = batch.advantages.view(-1)[valid_mask]
+                    returns_flat = batch.returns.view(-1)[valid_mask]
+                    entropy_flat = entropy.view(-1)[valid_mask]
 
-                # Track metrics
-                all_policy_losses.append(loss_output.policy_loss.item())
-                all_value_losses.append(loss_output.value_loss.item())
-                all_entropy_losses.append(loss_output.entropy_loss.item())
-                all_clip_fractions.append(loss_output.clip_fraction)
-                all_approx_kl.append(loss_output.approx_kl)
+                    # Compute loss
+                    loss_output = self.loss_fn(
+                        log_probs=log_probs_flat,
+                        old_log_probs=old_log_probs_flat,
+                        values=values_flat,
+                        old_values=old_values_flat,
+                        advantages=advantages_flat,
+                        returns=returns_flat,
+                        entropy=entropy_flat,
+                    )
 
-        # Update learning rate
-        self.scheduler.step()
+                    # Backpropagation
+                    self.optimizer.zero_grad()
+                    loss_output.total_loss.backward()
+
+                    # Gradient clipping
+                    nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.max_grad_norm,
+                    )
+
+                    self.optimizer.step()
+
+                    # Track metrics
+                    all_policy_losses.append(loss_output.policy_loss.item())
+                    all_value_losses.append(loss_output.value_loss.item())
+                    all_entropy_losses.append(loss_output.entropy_loss.item())
+                    all_clip_fractions.append(loss_output.clip_fraction)
+                    all_approx_kl.append(loss_output.approx_kl)
+            else:
+                # Non-LSTM: Use standard random batching
+                for batch in buffer.get(self.config.minibatch_size):
+                    # Evaluate actions with current policy
+                    log_probs, entropy, values, _ = self.model.evaluate_actions(
+                        batch.observations,
+                        batch.actions,
+                        None,  # No hidden state
+                        batch.action_masks,
+                    )
+
+                    # Compute loss
+                    loss_output = self.loss_fn(
+                        log_probs=log_probs,
+                        old_log_probs=batch.old_log_probs,
+                        values=values,
+                        old_values=batch.old_values,
+                        advantages=batch.advantages,
+                        returns=batch.returns,
+                        entropy=entropy,
+                    )
+
+                    # Backpropagation
+                    self.optimizer.zero_grad()
+                    loss_output.total_loss.backward()
+
+                    # Gradient clipping
+                    nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.max_grad_norm,
+                    )
+
+                    self.optimizer.step()
+
+                    # Track metrics
+                    all_policy_losses.append(loss_output.policy_loss.item())
+                    all_value_losses.append(loss_output.value_loss.item())
+                    all_entropy_losses.append(loss_output.entropy_loss.item())
+                    all_clip_fractions.append(loss_output.clip_fraction)
+                    all_approx_kl.append(loss_output.approx_kl)
+
+        # Update learning rate (suppress deprecation warning from SequentialLR)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*epoch parameter.*")
+            self.scheduler.step()
         self.global_step += buffer.total_samples
 
         # Compute explained variance
@@ -222,8 +344,8 @@ class PPO:
             all_values = []
             all_returns = []
             for batch in buffer.get(buffer.total_samples):
-                _, _, values = self.model.evaluate_actions(
-                    batch.observations, batch.actions, batch.action_masks
+                _, _, values, _ = self.model.evaluate_actions(
+                    batch.observations, batch.actions, None, batch.action_masks
                 )
                 all_values.append(values)
                 all_returns.append(batch.returns)
@@ -263,25 +385,36 @@ class PPO:
         Args:
             path: Path to load checkpoint from
         """
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.global_step = checkpoint['global_step']
+
+        # Try to load scheduler, but handle format changes gracefully
+        try:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        except (KeyError, TypeError) as e:
+            print(f"Warning: Could not load scheduler state (format changed), using fresh scheduler")
+
+        # Handle missing global_step (older checkpoints)
+        self.global_step = checkpoint.get('global_step', 0)
+        if 'global_step' not in checkpoint:
+            print(f"Warning: Checkpoint missing global_step, starting from 0")
 
     def get_action(
         self,
         obs: np.ndarray,
+        hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         deterministic: bool = False,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """Get action for inference.
 
         Args:
             obs: Observation [obs_dim] or [batch, obs_dim]
+            hidden: Optional LSTM hidden state
             deterministic: If True, return mode
 
         Returns:
-            Tuple of (action, log_prob)
+            Tuple of (action, log_prob, new_hidden)
         """
         self.model.eval()
 
@@ -290,8 +423,8 @@ class PPO:
                 obs = obs[np.newaxis, :]
 
             obs_tensor = torch.tensor(obs, device=self.device)
-            action, log_prob, _, _ = self.model.get_action(
-                obs_tensor, deterministic=deterministic
+            action, log_prob, _, _, new_hidden = self.model.get_action(
+                obs_tensor, hidden, deterministic=deterministic
             )
 
-            return action.cpu().numpy(), log_prob.cpu().numpy()
+            return action.cpu().numpy(), log_prob.cpu().numpy(), new_hidden
